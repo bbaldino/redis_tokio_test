@@ -1,33 +1,23 @@
-use std::{collections::HashMap, fmt::Display};
+use std::collections::HashMap;
 
 use rand::prelude::*;
 
 use redis::{
     streams::{StreamReadOptions, StreamReadReply},
-    AsyncCommands, RedisResult,
+    AsyncCommands,
 };
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 #[derive(Debug)]
 pub enum WorkerMsg {
-    AddSubscriber { id: String, sender: Sender<Msg> },
+    AddSubscriber { id: String },
     RemoveSubscriber { id: String },
-}
-
-struct SubscriberContext {
-    sender: Sender<Msg>,
-    last_read_msg_id: String,
 }
 
 struct Worker<ConnType> {
     msg_channel: Receiver<WorkerMsg>,
     connection: ConnType,
-    subscribers: HashMap<String, SubscriberContext>,
-}
-
-#[derive(Debug)]
-pub struct Msg {
-    value: String,
+    subscribers: HashMap<String, String>,
 }
 
 impl<T> Worker<T>
@@ -45,7 +35,7 @@ where
             stream_ids.clear();
             for (key, val) in self.subscribers.iter() {
                 stream_keys.push(key.to_owned());
-                stream_ids.push(val.last_read_msg_id.clone());
+                stream_ids.push(val.clone());
             }
             println!(
                 "[{i}] worker calling select: \n[{i}] keys: {:?}\n[{i}] ids:  {:?}",
@@ -55,13 +45,9 @@ where
                 worker_msg = self.msg_channel.recv() => {
                     println!("[{}] got a worker msg", i);
                     match worker_msg {
-                        Some(WorkerMsg::AddSubscriber { id, sender }) => {
+                        Some(WorkerMsg::AddSubscriber { id }) => {
                             println!("[{}] Adding subscriber {}", i, id);
-                            let subscriber_context = SubscriberContext {
-                                sender,
-                                last_read_msg_id: "0".to_owned(),
-                            };
-                            self.subscribers.insert(id, subscriber_context);
+                            self.subscribers.insert(id, "0".to_owned());
                         }
                         Some(WorkerMsg::RemoveSubscriber { id }) => {
                             println!("[{}] Removing subscriber {}", i, id);
@@ -76,8 +62,8 @@ where
                         for stream_key in stream_msg.keys {
                             for stream_id in stream_key.ids {
                                 println!("[{}] Received stream message {} on key {}: {:?}", i, stream_id.id, stream_key.key, stream_id);
-                                if let Some(stream_context) = self.subscribers.get_mut(&stream_key.key) {
-                                    stream_context.last_read_msg_id = stream_id.id;
+                                if let Some(last_read_msg_id) = self.subscribers.get_mut(&stream_key.key) {
+                                    *last_read_msg_id = stream_id.id;
                                 } else {
                                     println!("no subscriber found for {}", stream_key.key);
                                 }
@@ -92,19 +78,6 @@ where
     }
 }
 
-struct Subscriber {
-    receiver: Receiver<Msg>,
-}
-
-impl Subscriber {
-    async fn run(&mut self) {
-        loop {
-            let msg = self.receiver.recv().await;
-            println!("subscriber got msg: {:?}", msg);
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let subscriber = tracing_subscriber::fmt()
@@ -113,7 +86,7 @@ async fn main() {
         .with_line_number(true)
         .with_thread_ids(true)
         .with_target(false)
-        .with_max_level(tracing::Level::TRACE)
+        //.with_max_level(tracing::Level::TRACE)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber)
@@ -136,32 +109,25 @@ async fn main() {
     let mut subscriber_ids: Vec<String> = vec![];
 
     for _ in 1..=num_subscribers {
-        let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel(1);
-        let mut subscriber = Subscriber {
-            receiver: subscriber_rx,
-        };
-        tokio::spawn(async move {
-            subscriber.run().await;
-        });
-
         let subscriber_id: String = random::<u32>().to_string();
         subscriber_ids.push(subscriber_id.clone());
 
         worker_tx
             .send(WorkerMsg::AddSubscriber {
                 id: subscriber_id.clone(),
-                sender: subscriber_tx,
             })
             .await
             .unwrap();
     }
 
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     let mut connection = client.get_tokio_connection().await.unwrap();
     println!("[TEST] sending message");
     connection
         .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[0], "*", &[("data", "hello")])
         .await
         .unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     connection
         .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[0], "*", &[("data", "world")])
         .await
@@ -178,21 +144,12 @@ async fn main() {
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     println!("[TEST] adding more subscribers");
     for _ in 1..=num_subscribers {
-        let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel(1);
-        let mut subscriber = Subscriber {
-            receiver: subscriber_rx,
-        };
-        tokio::spawn(async move {
-            subscriber.run().await;
-        });
-
         let subscriber_id: String = random::<u32>().to_string();
         subscriber_ids.push(subscriber_id.clone());
 
         worker_tx
             .send(WorkerMsg::AddSubscriber {
                 id: subscriber_id.clone(),
-                sender: subscriber_tx,
             })
             .await
             .unwrap();
