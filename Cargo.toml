@@ -7,6 +7,9 @@ edition = "2021"
 
 [dependencies]
 rand = "0.8.5"
-redis = { version = "0.23.0", features = ["tokio-comp", "json", "streams"] }
+# redis = { version = "0.23.0", features = ["tokio-comp", "json", "streams"] }
+redis = { path = "../redis-rs/redis", features = ["tokio-comp", "json", "streams"] }
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.17"
 
