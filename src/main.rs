@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 use rand::prelude::*;
 
@@ -39,18 +39,23 @@ where
         let mut stream_keys: Vec<String> = vec![];
         let mut stream_ids: Vec<String> = vec![];
         loop {
+            println!("======================");
             stream_keys.clear();
             stream_ids.clear();
             for (key, val) in self.subscribers.iter() {
                 stream_keys.push(key.to_owned());
                 stream_ids.push(val.last_read_msg_id.clone());
             }
-            println!("worker calling select");
+            println!(
+                "worker calling select: \nkeys: {:?}\nids: {:?}",
+                stream_keys, stream_ids
+            );
             tokio::select! {
                 worker_msg = self.msg_channel.recv() => {
-                    println!("got a worker msg {:?}", worker_msg);
+                    println!("got a worker msg");
                     match worker_msg {
                         Some(WorkerMsg::AddSubscriber { id, sender }) => {
+                            println!("Adding subscriber {}", id);
                             let subscriber_context = SubscriberContext {
                                 sender,
                                 last_read_msg_id: "0".to_owned(),
@@ -58,13 +63,13 @@ where
                             self.subscribers.insert(id, subscriber_context);
                         }
                         Some(WorkerMsg::RemoveSubscriber { id }) => {
+                            println!("Removing subscriber {}", id);
                             self.subscribers.remove(&id);
                         }
                         None => {}
                     }
                 }
                 stream_read = self.connection.xread_options::<String, String, StreamReadReply>(&stream_keys, &stream_ids, &xread_options), if stream_keys.len() > 0 => {
-                    println!("did stream read with: {:?} {:?}", stream_keys, stream_ids);
                     if let Ok(stream_msg) = stream_read {
                         for stream_key in stream_msg.keys {
                             for stream_id in stream_key.ids {
@@ -101,7 +106,7 @@ impl Subscriber {
 #[tokio::main]
 async fn main() {
     let client = redis::Client::open("redis://172.17.0.3").unwrap();
-    let worker_connection = client.get_tokio_connection().await.unwrap();
+    let worker_connection = client.get_multiplexed_tokio_connection().await.unwrap();
 
     let (worker_tx, worker_rx) = tokio::sync::mpsc::channel(1);
     let mut worker = Worker {
@@ -138,9 +143,65 @@ async fn main() {
             .unwrap();
     }
 
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     let mut connection = client.get_tokio_connection().await.unwrap();
+    println!("sending message");
     connection
         .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[0], "*", &[("data", "hello")])
+        .await
+        .unwrap();
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[0], "*", &[("data", "world")])
+        .await
+        .unwrap();
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[1], "*", &[("data", "hello")])
+        .await
+        .unwrap();
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[1], "*", &[("data", "world")])
+        .await
+        .unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    println!("adding more subscribers");
+    for _ in 1..=num_subscribers {
+        let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel(1);
+        let mut subscriber = Subscriber {
+            receiver: subscriber_rx,
+        };
+        tokio::spawn(async move {
+            subscriber.run().await;
+        });
+
+        let subscriber_id: String = random::<u32>().to_string();
+        subscriber_ids.push(subscriber_id.clone());
+
+        worker_tx
+            .send(WorkerMsg::AddSubscriber {
+                id: subscriber_id.clone(),
+                sender: subscriber_tx,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut connection = client.get_tokio_connection().await.unwrap();
+    println!("sending another message");
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[2], "*", &[("data", "hello")])
+        .await
+        .unwrap();
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[2], "*", &[("data", "world")])
+        .await
+        .unwrap();
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[3], "*", &[("data", "hello")])
+        .await
+        .unwrap();
+    connection
+        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[3], "*", &[("data", "world")])
         .await
         .unwrap();
 
