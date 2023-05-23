@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use rand::prelude::*;
 
 use redis::{
+    aio::ConnectionLike,
     streams::{StreamReadOptions, StreamReadReply},
     AsyncCommands,
 };
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 #[derive(Debug)]
 pub enum WorkerMsg {
@@ -57,7 +58,6 @@ where
                     }
                 }
                 stream_read = self.connection.xread_options::<String, String, StreamReadReply>(&stream_keys, &stream_ids, &xread_options), if stream_keys.len() > 0 => {
-                //stream_read = Self::read(self.connection.clone(), &stream_keys, &stream_ids, &xread_options), if stream_keys.len() > 0 => {
                     if let Ok(stream_msg) = stream_read {
                         for stream_key in stream_msg.keys {
                             for stream_id in stream_key.ids {
@@ -75,6 +75,35 @@ where
                 }
             }
         }
+    }
+}
+
+struct TestHarness<T> {
+    connection: T,
+    worker_tx: Sender<WorkerMsg>,
+}
+
+impl<T> TestHarness<T>
+where
+    T: ConnectionLike + Send,
+{
+    async fn add_subscriber(&mut self) -> String {
+        let subscriber_id: String = random::<u32>().to_string();
+        self.worker_tx
+            .send(WorkerMsg::AddSubscriber {
+                id: subscriber_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        subscriber_id
+    }
+
+    async fn send_msg(&mut self, id: &str, msg: &str) {
+        self.connection
+            .xadd::<&str, &str, &str, &str, ()>(&id, "*", &[("data", msg)])
+            .await
+            .unwrap();
     }
 }
 
@@ -105,73 +134,17 @@ async fn main() {
         worker.run().await;
     });
 
-    let num_subscribers = 2;
-    let mut subscriber_ids: Vec<String> = vec![];
+    let connection = client.get_tokio_connection().await.unwrap();
+    let mut harness = TestHarness {
+        connection,
+        worker_tx,
+    };
 
-    for _ in 1..=num_subscribers {
-        let subscriber_id: String = random::<u32>().to_string();
-        subscriber_ids.push(subscriber_id.clone());
+    let _ = harness.add_subscriber().await;
 
-        worker_tx
-            .send(WorkerMsg::AddSubscriber {
-                id: subscriber_id.clone(),
-            })
-            .await
-            .unwrap();
-    }
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    let id_2 = harness.add_subscriber().await;
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    let mut connection = client.get_tokio_connection().await.unwrap();
-    println!("[TEST] sending message");
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[0], "*", &[("data", "hello")])
-        .await
-        .unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[0], "*", &[("data", "world")])
-        .await
-        .unwrap();
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[1], "*", &[("data", "hello")])
-        .await
-        .unwrap();
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[1], "*", &[("data", "world")])
-        .await
-        .unwrap();
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    println!("[TEST] adding more subscribers");
-    for _ in 1..=num_subscribers {
-        let subscriber_id: String = random::<u32>().to_string();
-        subscriber_ids.push(subscriber_id.clone());
-
-        worker_tx
-            .send(WorkerMsg::AddSubscriber {
-                id: subscriber_id.clone(),
-            })
-            .await
-            .unwrap();
-    }
-
-    println!("[TEST] sending another message");
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[2], "*", &[("data", "hello")])
-        .await
-        .unwrap();
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[2], "*", &[("data", "world")])
-        .await
-        .unwrap();
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[3], "*", &[("data", "hello")])
-        .await
-        .unwrap();
-    connection
-        .xadd::<&str, &str, &str, &str, ()>(&subscriber_ids[3], "*", &[("data", "world")])
-        .await
-        .unwrap();
-
+    harness.send_msg(id_2.as_str(), "hello2").await;
     worker_task.await.unwrap();
 }
